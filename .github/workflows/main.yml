@@ -1,0 +1,68 @@
+name: macos build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp in (packaging override only; package.json is not modified)'
+        required: false
+        default: '0.1.0'
+
+# Read-only: this uploads workflow artifacts and creates no release.
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # NOT 20. See the note below - electron-builder 26.15.3 fails on
+          # Node 20 with ERR_REQUIRE_ESM while building the blockmap.
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: package (unsigned)
+        env:
+          # Without this, electron-builder hunts for a signing identity in the
+          # runner keychain and its behaviour depends on what it finds.
+          # Explicitly off = deterministic unsigned build.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          set -o pipefail
+          npx electron-builder --mac dmg zip --publish never \
+            -c.extraMetadata.version=${{ inputs.version }} \
+            -c.directories.output=release-0.1.0 2>&1 | tee build.log
+
+      - name: verify the packaged version, not the filename
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for dmg in release-0.1.0/*.dmg; do
+            echo "=== $dmg"
+            mnt=$(mktemp -d)
+            hdiutil attach -nobrowse -readonly "$dmg" -mountpoint "$mnt" >/dev/null
+            plist="$mnt/RPCTION.app/Contents/Info.plist"
+            echo "  CFBundleShortVersionString: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+            echo "  CFBundleVersion:            $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")"
+            echo "  arch:                       $(lipo -archs "$mnt/RPCTION.app/Contents/MacOS/RPCTION" 2>/dev/null || echo '?')"
+            hdiutil detach "$mnt" >/dev/null
+          done
+          echo "=== sizes and hashes"
+          shasum -a 256 release-0.1.0/*.dmg release-0.1.0/*.zip
+          ls -l release-0.1.0/*.dmg release-0.1.0/*.zip | awk '{print $5, $9}'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpction-macos-${{ inputs.version }}
+          path: |
+            release-0.1.0/*.dmg
+            release-0.1.0/*.zip
+          if-no-files-found: error
